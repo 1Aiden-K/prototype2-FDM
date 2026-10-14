@@ -21,6 +21,7 @@ SYSTEM_THREAD(ENABLED);
 
 // LED configuration
 const int LED_PINS[3] = {D8, A4, A0};
+// Placeholder values
 const uint32_t LED_FREQS[3] = {7, 11, 17};
 const uint8_t DUTY_CYCLE = 128;
 

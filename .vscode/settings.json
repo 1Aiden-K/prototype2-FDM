@@ -3,5 +3,7 @@
     "C_Cpp.default.configurationProvider": "particle.particle-vscode-core",
     "files.associations": {
         "*.ino": "cpp"
-    }
+    },
+    "stm32-for-vscode.openOCDPath": false,
+    "stm32-for-vscode.armToolchainPath": false
 }
