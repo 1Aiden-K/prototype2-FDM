@@ -1,83 +1,197 @@
 
 /*
  * Three-Wavelength FDM Oximeter
- * Target: Particle Argon
+ * Target: Particle Argon (nRF52840)
  *
- * LEDs: 660 nm (7 Hz), 805 nm (11 Hz), 940 nm (17 Hz)
- * Detector: OPT101P on A1
+ * LEDs:
+ *   660 nm -> D8 -> 7 Hz
+ *   805 nm -> A4 -> 11 Hz
+ *   940 nm -> A0 -> 17 Hz
  *
- * Samples at 500 Hz and separates the three
- * frequencies using synchronous demodulation.
+ * Detector: OPT101P -> A1
  *
- * Serial CSV output:
- * dc_v,red_v,ir805_v,ir940_v,dropped_windows
+ * ADC:
+ *   20,000 samples/second
+ *   12-bit resolution
+ *   Hardware timer + DMA
+ *   Double-buffered acquisition
+ *
+ * Demodulation:
+ *   Three simultaneous I/Q correlations
+ *   1-second measurement windows
+ *
+ * CSV:
+ * dc_v,red_v,ir805_v,ir940_v,
+ * dropped_buffers,invalid_windows
  */
 
 #include "Particle.h"
+#include "ADCDMAGen3_RK.h"
 #include <math.h>
 
 SYSTEM_MODE(MANUAL);
 SYSTEM_THREAD(ENABLED);
 
+// ----------------------------
 // LED configuration
+// ----------------------------
+
 const int LED_PINS[3] = {D8, A4, A0};
-// Placeholder values
+
+// Placeholder modulation frequencies
 const uint32_t LED_FREQS[3] = {7, 11, 17};
+
 const uint8_t DUTY_CYCLE = 128;
 
-// Photodetector configuration
-const int SENSOR_PIN = A1;
-const uint32_t SAMPLE_RATE = 500;
-const uint32_t SAMPLE_PERIOD_US = 1000000UL / SAMPLE_RATE;
-const uint16_t WINDOW_SIZE = SAMPLE_RATE;
+// ----------------------------
+// ADC configuration
+// ----------------------------
 
-// ADC: 12-bit, 0-3.3V
+const int SENSOR_PIN = A1;
+
+// Change to 10000 for 10 kHz
+const uint32_t SAMPLE_RATE = 20000;
+
+// 2000 samples = 100 ms per buffer
+// at 20 kHz.
+const size_t BUFFER_SIZE = 2000;
+
+// 1-second demodulation window
+const uint32_t WINDOW_SIZE = SAMPLE_RATE;
+
+// ADC: 12-bit, nominally 0-3.3 V
 const float ADC_SCALE = 3.3f / 4095.0f;
+
 const float TWO_PI = 6.28318530718f;
 
-// Demodulation state for each wavelength
+// ----------------------------
+// DMA configuration
+// ----------------------------
+
+ADCDMAGen3 adc;
+
+// DMA buffers (8 KB total)
+static nrf_saadc_value_t buffer0[BUFFER_SIZE];
+static nrf_saadc_value_t buffer1[BUFFER_SIZE];
+
+// Shared between interrupt and loop
+static nrf_saadc_value_t *volatile
+    readyBuffer = nullptr;
+
+static volatile uint32_t readySequence = 0;
+static volatile uint32_t callbackSequence = 0;
+
+// Main-loop counters
+uint32_t lastSequence = 0;
+uint32_t droppedBuffers = 0;
+uint32_t invalidWindows = 0;
+
+// ----------------------------
+// Demodulation
+// ----------------------------
+
 struct Channel {
     float cosStep;
     float sinStep;
+
     float cosPhase;
     float sinPhase;
+
     float sumI;
     float sumQ;
 };
 
 Channel channels[3];
 
-uint32_t nextSampleTime;
-uint32_t droppedWindows = 0;
-uint16_t sampleCount = 0;
-float dcSum = 0;
-bool headerPrinted = false;
+uint32_t sampleCount = 0;
+float dcSum = 0.0f;
 
-// Reset accumulators for a new measurement window
+// ----------------------------
+// Output state
+// ----------------------------
+
+struct Measurement {
+    float dc;
+    float amplitude[3];
+
+    uint32_t droppedBuffers;
+    uint32_t invalidWindows;
+};
+
+Measurement latestMeasurement;
+
+bool measurementReady = false;
+bool headerPrinted = false;
+bool adcStarted = false;
+
+ret_code_t adcError = 0;
+
+// ----------------------------
+// Reset measurement window
+// ----------------------------
+
 void resetWindow() {
     sampleCount = 0;
-    dcSum = 0;
-
-    for (int i = 0; i < 3; i++) {
-        channels[i].cosPhase = 1.0f;
-        channels[i].sinPhase = 0.0f;
-        channels[i].sumI = 0.0f;
-        channels[i].sumQ = 0.0f;
-    }
-}
-
-// Process one photodetector sample
-void processSample(float voltage) {
-    dcSum += voltage;
+    dcSum = 0.0f;
 
     for (int i = 0; i < 3; i++) {
         Channel &ch = channels[i];
 
-        // In-phase and quadrature correlation
-        ch.sumI += voltage * ch.cosPhase;
-        ch.sumQ += voltage * ch.sinPhase;
+        ch.cosPhase = 1.0f;
+        ch.sinPhase = 0.0f;
 
-        // Advance reference oscillator
+        ch.sumI = 0.0f;
+        ch.sumQ = 0.0f;
+    }
+}
+
+// ----------------------------
+// Finish measurement window
+// ----------------------------
+
+void finishWindow() {
+    Measurement &m = latestMeasurement;
+
+    m.dc = (dcSum / WINDOW_SIZE) * ADC_SCALE;
+
+    for (int i = 0; i < 3; i++) {
+        Channel &ch = channels[i];
+
+        float I = ch.sumI;
+        float Q = ch.sumQ;
+
+        float magnitude = sqrtf(I * I + Q * Q);
+
+        m.amplitude[i] =
+            (2.0f / WINDOW_SIZE) *
+            magnitude * ADC_SCALE;
+    }
+
+    m.droppedBuffers = droppedBuffers;
+    m.invalidWindows = invalidWindows;
+
+    measurementReady = true;
+
+    resetWindow();
+}
+
+// ----------------------------
+// Process individual sample
+// ----------------------------
+
+void processSample(int16_t raw) {
+    float sample = (float)raw;
+
+    dcSum += sample;
+
+    for (int i = 0; i < 3; i++) {
+        Channel &ch = channels[i];
+
+        // In-phase and quadrature sums
+        ch.sumI += sample * ch.cosPhase;
+        ch.sumQ += sample * ch.sinPhase;
+
+        // Update reference oscillator
         float nextCos =
             ch.cosPhase * ch.cosStep -
             ch.sinPhase * ch.sinStep;
@@ -91,39 +205,75 @@ void processSample(float voltage) {
     }
 
     sampleCount++;
+
+    if (sampleCount >= WINDOW_SIZE) {
+        finishWindow();
+    }
 }
 
-// Output one completed measurement window
-void reportWindow() {
-    float dc = dcSum / WINDOW_SIZE;
-    float amplitude[3];
+// ----------------------------
+// Process completed DMA buffer
+// ----------------------------
+
+void processBuffer(
+    nrf_saadc_value_t *buffer,
+    size_t size
+) {
+    for (size_t i = 0; i < size; i++) {
+        processSample(buffer[i]);
+    }
+}
+
+// ----------------------------
+// DMA callback
+// Runs in interrupt context
+// ----------------------------
+
+void onBufferReady(
+    nrf_saadc_value_t *buffer,
+    size_t size
+) {
+    // No processing or serial output here.
+    // Publish the newest completed buffer.
+    ++callbackSequence;
+
+    readySequence = callbackSequence;
+    readyBuffer = buffer;
+}
+
+// ----------------------------
+// Serial output
+// ----------------------------
+
+void printMeasurement() {
+    if (!Serial.isConnected()) {
+        return;
+    }
+
+    Measurement &m = latestMeasurement;
+
+    Serial.print(m.dc, 6);
 
     for (int i = 0; i < 3; i++) {
-        float I = channels[i].sumI;
-        float Q = channels[i].sumQ;
-
-        amplitude[i] =
-            (2.0f / WINDOW_SIZE) *
-            sqrtf(I * I + Q * Q);
-    }
-
-    if (Serial.isConnected()) {
-        Serial.print(dc, 6);
-
-        for (int i = 0; i < 3; i++) {
-            Serial.print(",");
-            Serial.print(amplitude[i], 6);
-        }
-
         Serial.print(",");
-        Serial.println(droppedWindows);
+        Serial.print(m.amplitude[i], 6);
     }
+
+    Serial.print(",");
+    Serial.print(m.droppedBuffers);
+
+    Serial.print(",");
+    Serial.println(m.invalidWindows);
 }
+
+// ----------------------------
+// Setup
+// ----------------------------
 
 void setup() {
     Serial.begin(115200);
 
-    // Configure and start independent PWM
+    // Configure hardware PWM
     for (int i = 0; i < 3; i++) {
         pinMode(LED_PINS[i], OUTPUT);
 
@@ -133,7 +283,7 @@ void setup() {
             LED_FREQS[i]
         );
 
-        // Precompute reference oscillator increments
+        // Reference oscillator increments
         float angle =
             TWO_PI * LED_FREQS[i] / SAMPLE_RATE;
 
@@ -143,55 +293,99 @@ void setup() {
 
     resetWindow();
 
-    nextSampleTime = micros() + SAMPLE_PERIOD_US;
+    // Configure continuous ADC DMA
+    adcError = adc
+        .withSampleFreqHz(SAMPLE_RATE)
+        .withDoubleBuffer(
+            BUFFER_SIZE,
+            buffer0,
+            buffer1
+        )
+        .withSamplePin(SENSOR_PIN)
+        .withResolution(NRF_SAADC_RESOLUTION_12BIT)
+        .withAcqTime(NRF_SAADC_ACQTIME_10US)
+        .withBufferCallback(onBufferReady)
+        .init();
+
+    if (adcError != 0) {
+        return;
+    }
+
+    // Start hardware-timed acquisition
+    adc.start();
+    adcStarted = true;
 }
 
+// ----------------------------
+// Main loop
+// ----------------------------
+
 void loop() {
-    // Print CSV header when serial connects
+    // Handle serial connection
     if (Serial.isConnected()) {
         if (!headerPrinted) {
-            Serial.println(
-                "dc_v,red_v,ir805_v,ir940_v,dropped_windows"
-            );
+            if (!adcStarted) {
+                Serial.print("ADC initialization failed: ");
+                Serial.println((unsigned long)adcError);
+            } else {
+                Serial.println(
+                    "dc_v,red_v,ir805_v,ir940_v,"
+                    "dropped_buffers,invalid_windows"
+                );
+            }
+
             headerPrinted = true;
         }
     } else {
         headerPrinted = false;
     }
 
-    uint32_t now = micros();
-    int32_t lateness =
-        (int32_t)(now - nextSampleTime);
-
-    // Wait until the next scheduled ADC sample
-    if (lateness < 0) {
+    if (!adcStarted) {
         return;
     }
 
-    // Discard incomplete windows if sampling
-    // falls more than one interval behind.
-    if (lateness >= (int32_t)SAMPLE_PERIOD_US) {
-        droppedWindows++;
-        resetWindow();
-        nextSampleTime = now + SAMPLE_PERIOD_US;
-        return;
+    // Retrieve completed DMA buffer.
+    // Keep interrupt masking very short.
+    nrf_saadc_value_t *buffer;
+    uint32_t sequence;
+
+    noInterrupts();
+
+    buffer = readyBuffer;
+    sequence = readySequence;
+    readyBuffer = nullptr;
+
+    interrupts();
+
+    if (buffer != nullptr) {
+
+        // Detect skipped buffers
+        uint32_t expected = lastSequence + 1;
+
+        if (sequence != expected) {
+            droppedBuffers +=
+                sequence - expected;
+
+            // Discard incomplete measurement.
+            // A gap makes the correlation invalid.
+            if (sampleCount != 0) {
+                invalidWindows++;
+            }
+
+            resetWindow();
+        }
+
+        lastSequence = sequence;
+
+        // Process samples while DMA fills
+        // the other buffer.
+        processBuffer(buffer, BUFFER_SIZE);
     }
 
-    nextSampleTime += SAMPLE_PERIOD_US;
-
-    // Read OPT101P
-    int raw = analogRead(SENSOR_PIN);
-    float voltage = raw * ADC_SCALE;
-
-    processSample(voltage);
-
-    // One complete measurement window
-    if (sampleCount >= WINDOW_SIZE) {
-        reportWindow();
-        resetWindow();
-
-        // Restart after reporting, avoiding
-        // serial-output timing affecting samples.
-        nextSampleTime = micros() + SAMPLE_PERIOD_US;
+    // Serial output is outside both the
+    // DMA callback and the sample loop.
+    if (measurementReady && Serial.isConnected()) {
+        printMeasurement();
+        measurementReady = false;
     }
 }
