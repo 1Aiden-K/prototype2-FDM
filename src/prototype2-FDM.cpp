@@ -10,9 +10,8 @@
  *
  * OPT101P photodetector -> A1
  *
- * ADC sampling: 500 Hz
- * Raw Teleplot updates: 100 Hz
- * Demodulated updates: 1 Hz
+ * ADC sampling: 10000 Hz
+ * Amplitudes Logged 0.2Hz
  */
 
 #include "Particle.h"
@@ -46,6 +45,14 @@ const uint8_t PLOT_EVERY_N_SAMPLES = 5;
 
 const float ADC_SCALE = 3.3f / 4095.0f;
 const float TWO_PI = 6.28318530718f;
+
+// ----------------------------
+// Reporting configuration
+// ----------------------------
+const uint8_t REPORT_EVERY_WINDOWS = 5;
+
+uint8_t windowsSinceReport = 0;
+bool reportPending = false;
 
 // ----------------------------
 // Demodulation state
@@ -133,8 +140,6 @@ void processSample(float voltage) {
 // ----------------------------
 
 void reportWindow() {
-    lastDC = dcSum / WINDOW_SIZE;
-
     for (int i = 0; i < 3; i++) {
         float I = channels[i].sumI;
         float Q = channels[i].sumQ;
@@ -144,10 +149,43 @@ void reportWindow() {
             sqrtf(I * I + Q * Q);
     }
 
-    lastDropped = droppedWindows;
+    if (++windowsSinceReport >= REPORT_EVERY_WINDOWS) {
+        windowsSinceReport = 0;
+        reportPending = true;
+    }
+}
 
-    // Queue results for Teleplot
-    summaryIndex = 0;
+// ----------------------------
+// Display values
+// ----------------------------
+
+void sendAmplitudes() {
+    if (!reportPending || !Serial.isConnected()) {
+        return;
+    }
+
+    char line[80];
+
+    int length = snprintf(
+        line, sizeof(line),
+        "red=%.6f,805=%.6f,940=%.6f\n",
+        lastAmplitude[0],
+        lastAmplitude[1],
+        lastAmplitude[2]
+    );
+
+    if (length <= 0 || length >= (int)sizeof(line)) {
+        return;
+    }
+
+    if (Serial.availableForWrite() >= length) {
+        Serial.write(
+            (const uint8_t*)line,
+            (size_t)length
+        );
+
+        reportPending = false;
+    }
 }
 
 // ----------------------------
@@ -209,6 +247,7 @@ void loop() {
 
         droppedWindows++;
         resetWindow();
+        nextSampleTime = micros() + SAMPLE_PERIOD_US;
 
         return;
     }
@@ -221,12 +260,26 @@ void loop() {
 
     processSample(voltage);
 
-    // Completed 1-second window
     if (sampleCount >= WINDOW_SIZE) {
-        reportWindow();
-        resetWindow();
+    reportWindow();
+    resetWindow();
 
-        nextSampleTime =
-            micros() + SAMPLE_PERIOD_US;
+    // Serial output every 5 windows
+    static uint8_t windowCounter = 0;
+
+    if (++windowCounter >= 5) {
+        windowCounter = 0;
+
+        if (Serial.isConnected()) {
+            Serial.printf(
+                "660: %.6f, 805: %.6f, 940: %.6f\n",
+                lastAmplitude[0],
+                lastAmplitude[1],
+                lastAmplitude[2]
+            );
+        }
     }
+
+    nextSampleTime = micros() + SAMPLE_PERIOD_US;
+}
 }
