@@ -6,7 +6,7 @@
 
 ADCDMAGen3 *ADCDMAGen3::instance = 0;
 
-static Logger log("app.adc");
+static Logger adcLog("app.adc");
 
 // This should match what's defined in adc_hal.cpp
 static const nrfx_saadc_config_t defaultSaadcConfig = {
@@ -62,7 +62,7 @@ ret_code_t ADCDMAGen3::init() {
 	ret_code_t err;
 
 	if (pinList.empty()) {
-		log.error("no pins set");
+		adcLog.error("no pins set");
 		return 1;
 	}
 
@@ -93,7 +93,7 @@ ret_code_t ADCDMAGen3::init() {
 	// Initialize SAADC
 	err = nrfx_saadc_init(&saadcConfig, adcCallbackStatic);
 	if (err) {
-		log.error("nrfx_saadc_init err=%lu", err);
+		adcLog.error("nrfx_saadc_init err=%lu", err);
 		return err;
 	}
 	setupState = SetupState::SAADC_INIT;
@@ -108,7 +108,7 @@ ret_code_t ADCDMAGen3::init() {
 		channelConfig.pin_p = ain;
 		err = nrfx_saadc_channel_init(ain - NRF_SAADC_INPUT_AIN0, &channelConfig);
 		if (err) {
-			log.error("nrfx_saadc_channel_init err=%lu pin=%d", err, particlePin);
+			adcLog.error("nrfx_saadc_channel_init err=%lu pin=%d", err, particlePin);
 			return err;
 		}
 	}
@@ -118,7 +118,7 @@ ret_code_t ADCDMAGen3::init() {
 		// Where to store the data
 		err = nrfx_saadc_buffer_convert(bufferPool[ii], bufferSize);
 		if (err) {
-			log.error("nrfx_saadc_buffer_convert err=%lu ii=%d", err, ii);
+			adcLog.error("nrfx_saadc_buffer_convert err=%lu ii=%d", err, ii);
 			return err;
 		}
 	}
@@ -126,7 +126,7 @@ ret_code_t ADCDMAGen3::init() {
 	// Initialize the timer
     err = nrfx_timer_init(&hardwareTimer, &timerConfig, timerCallbackStatic);
 	if (err) {
-		log.error("nrfx_timer_init err=%lu", err);
+		adcLog.error("nrfx_timer_init err=%lu", err);
 		return err;
 	}
 	setupState = SetupState::TIMER_INIT;
@@ -148,20 +148,20 @@ ret_code_t ADCDMAGen3::init() {
     // setup ppi channel so that timer compare event is triggering sample task in SAADC
     err = nrfx_ppi_channel_alloc(&ppiChannel);
 	if (err) {
-		log.error("nrfx_ppi_channel_alloc err=%lu", err);
+		adcLog.error("nrfx_ppi_channel_alloc err=%lu", err);
 		return err;
 	}
 	setupState = SetupState::PPI_ALLOC;
 
     err = nrfx_ppi_channel_assign(ppiChannel, timerCompareEventAddr, saadcSampleTaskAddr);
 	if (err) {
-		log.error("nrfx_ppi_channel_assign err=%lu", err);
+		adcLog.error("nrfx_ppi_channel_assign err=%lu", err);
 		return err;
 	}
 
 	err = nrfx_ppi_channel_enable(ppiChannel);
 	if (err) {
-		log.error("nrfx_ppi_channel_enable err=%lu", err);
+		adcLog.error("nrfx_ppi_channel_enable err=%lu", err);
 		return err;
 	}
 	setupState = SetupState::COMPLETE;
@@ -175,7 +175,7 @@ void ADCDMAGen3::uninit() {
 		// nrfx_ppi_channel_free will disable the channel if necessary, no need to do it here
 		ret_code_t err = nrfx_ppi_channel_free(ppiChannel);
 		if (err) {
-			log.error("nrfx_ppi_channel_free err=%lu", err);
+			adcLog.error("nrfx_ppi_channel_free err=%lu", err);
 		}
 	}
 

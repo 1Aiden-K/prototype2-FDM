@@ -1,90 +1,53 @@
-
 /*
  * Three-Wavelength FDM Oximeter
- * Target: Particle Argon (nRF52840)
+ * Particle Argon (nRF52840)
  *
- * LEDs:
- *   660 nm -> D8 -> 7 Hz
- *   805 nm -> A4 -> 11 Hz
- *   940 nm -> A0 -> 17 Hz
+ * ADC: A1, 20 kHz, 12-bit
+ * LEDs: D8 (7 Hz), A4 (11 Hz), A0 (17 Hz)
  *
- * Detector: OPT101P -> A1
- *
- * ADC:
- *   20,000 samples/second
- *   12-bit resolution
- *   Hardware timer + DMA
- *   Double-buffered acquisition
- *
- * Demodulation:
- *   Three simultaneous I/Q correlations
- *   1-second measurement windows
- *
- * CSV:
- * dc_v,red_v,ir805_v,ir940_v,
- * dropped_buffers,invalid_windows
+ * Uses SAADC internal timer + EasyDMA + PPI.
+ * Requires no third-party libraries.
  */
 
 #include "Particle.h"
-#include "ADCDMAGen3_RK.h"
+#undef CHG
+#include "nrf.h"
+#include "nrfx_ppi.h"
 #include <math.h>
 
 SYSTEM_MODE(MANUAL);
-SYSTEM_THREAD(ENABLED);
 
 // ----------------------------
-// LED configuration
+// Configuration
 // ----------------------------
 
 const int LED_PINS[3] = {D8, A4, A0};
-
-// Placeholder modulation frequencies
 const uint32_t LED_FREQS[3] = {7, 11, 17};
 
-const uint8_t DUTY_CYCLE = 128;
-
-// ----------------------------
-// ADC configuration
-// ----------------------------
-
-const int SENSOR_PIN = A1;
-
-// Change to 10000 for 10 kHz
 const uint32_t SAMPLE_RATE = 20000;
-
-// 2000 samples = 100 ms per buffer
-// at 20 kHz.
-const size_t BUFFER_SIZE = 2000;
-
-// 1-second demodulation window
+const uint32_t BUFFER_SIZE = 2000;
+const uint32_t BUFFER_COUNT = 4;
 const uint32_t WINDOW_SIZE = SAMPLE_RATE;
 
-// ADC: 12-bit, nominally 0-3.3 V
 const float ADC_SCALE = 3.3f / 4095.0f;
-
-const float TWO_PI = 6.28318530718f;
+constexpr float TWO_PI_F = 6.28318530718f;
 
 // ----------------------------
-// DMA configuration
+// ADC buffers and state
 // ----------------------------
 
-ADCDMAGen3 adc;
+static int16_t adcBuffers[BUFFER_COUNT][BUFFER_SIZE];
 
-// DMA buffers (8 KB total)
-static nrf_saadc_value_t buffer0[BUFFER_SIZE];
-static nrf_saadc_value_t buffer1[BUFFER_SIZE];
+volatile uint32_t completedBuffers = 0;
 
-// Shared between interrupt and loop
-static nrf_saadc_value_t *volatile
-    readyBuffer = nullptr;
-
-static volatile uint32_t readySequence = 0;
-static volatile uint32_t callbackSequence = 0;
-
-// Main-loop counters
-uint32_t lastSequence = 0;
+uint32_t processedBuffers = 0;
 uint32_t droppedBuffers = 0;
 uint32_t invalidWindows = 0;
+
+nrf_ppi_channel_t ppiChannel;
+
+bool adcRunning = false;
+bool headerPrinted = false;
 
 // ----------------------------
 // Demodulation
@@ -99,32 +62,15 @@ struct Channel {
 
     float sumI;
     float sumQ;
+
+    float sumCos;
+    float sumSin;
 };
 
 Channel channels[3];
 
 uint32_t sampleCount = 0;
 float dcSum = 0.0f;
-
-// ----------------------------
-// Output state
-// ----------------------------
-
-struct Measurement {
-    float dc;
-    float amplitude[3];
-
-    uint32_t droppedBuffers;
-    uint32_t invalidWindows;
-};
-
-Measurement latestMeasurement;
-
-bool measurementReady = false;
-bool headerPrinted = false;
-bool adcStarted = false;
-
-ret_code_t adcError = 0;
 
 // ----------------------------
 // Reset measurement window
@@ -142,56 +88,74 @@ void resetWindow() {
 
         ch.sumI = 0.0f;
         ch.sumQ = 0.0f;
+
+        ch.sumCos = 0.0f;
+        ch.sumSin = 0.0f;
     }
 }
 
 // ----------------------------
-// Finish measurement window
+// Report completed window
 // ----------------------------
 
-void finishWindow() {
-    Measurement &m = latestMeasurement;
+void reportWindow() {
+    float dcRaw = dcSum / WINDOW_SIZE;
+    float dc = dcRaw * ADC_SCALE;
 
-    m.dc = (dcSum / WINDOW_SIZE) * ADC_SCALE;
+    float amplitude[3];
 
     for (int i = 0; i < 3; i++) {
         Channel &ch = channels[i];
 
-        float I = ch.sumI;
-        float Q = ch.sumQ;
+        // Remove DC leakage from correlation
+        float I = ch.sumI - dcRaw * ch.sumCos;
+        float Q = ch.sumQ - dcRaw * ch.sumSin;
 
-        float magnitude = sqrtf(I * I + Q * Q);
-
-        m.amplitude[i] =
+        amplitude[i] =
             (2.0f / WINDOW_SIZE) *
-            magnitude * ADC_SCALE;
+            sqrtf(I * I + Q * Q) *
+            ADC_SCALE;
     }
 
-    m.droppedBuffers = droppedBuffers;
-    m.invalidWindows = invalidWindows;
+    if (!Serial.isConnected() ||
+        Serial.availableForWrite() < 100) {
+        return;
+    }
 
-    measurementReady = true;
+    Serial.print(dc, 6);
 
-    resetWindow();
+    for (int i = 0; i < 3; i++) {
+        Serial.print(",");
+        Serial.print(amplitude[i], 6);
+    }
+
+    Serial.print(",");
+    Serial.print(droppedBuffers);
+
+    Serial.print(",");
+    Serial.println(invalidWindows);
 }
 
 // ----------------------------
-// Process individual sample
+// Process one ADC sample
 // ----------------------------
 
 void processSample(int16_t raw) {
-    float sample = (float)raw;
+    // Single-ended readings can be slightly
+    // negative due to ADC offset.
+    float sample = (raw < 0) ? 0.0f : (float)raw;
 
     dcSum += sample;
 
     for (int i = 0; i < 3; i++) {
         Channel &ch = channels[i];
 
-        // In-phase and quadrature sums
         ch.sumI += sample * ch.cosPhase;
         ch.sumQ += sample * ch.sinPhase;
 
-        // Update reference oscillator
+        ch.sumCos += ch.cosPhase;
+        ch.sumSin += ch.sinPhase;
+
         float nextCos =
             ch.cosPhase * ch.cosStep -
             ch.sinPhase * ch.sinStep;
@@ -206,8 +170,9 @@ void processSample(int16_t raw) {
 
     sampleCount++;
 
-    if (sampleCount >= WINDOW_SIZE) {
-        finishWindow();
+    if (sampleCount == WINDOW_SIZE) {
+        reportWindow();
+        resetWindow();
     }
 }
 
@@ -215,55 +180,151 @@ void processSample(int16_t raw) {
 // Process completed DMA buffer
 // ----------------------------
 
-void processBuffer(
-    nrf_saadc_value_t *buffer,
-    size_t size
-) {
-    for (size_t i = 0; i < size; i++) {
-        processSample(buffer[i]);
+void processBuffer(uint32_t index) {
+    for (uint32_t i = 0; i < BUFFER_SIZE; i++) {
+        processSample(adcBuffers[index][i]);
     }
 }
 
 // ----------------------------
-// DMA callback
-// Runs in interrupt context
+// SAADC interrupt handler
 // ----------------------------
 
-void onBufferReady(
-    nrf_saadc_value_t *buffer,
-    size_t size
-) {
-    // No processing or serial output here.
-    // Publish the newest completed buffer.
-    ++callbackSequence;
+void saadcInterrupt() {
+    // One DMA buffer has completed.
+    if (NRF_SAADC->EVENTS_END) {
+        NRF_SAADC->EVENTS_END = 0;
 
-    readySequence = callbackSequence;
-    readyBuffer = buffer;
+        completedBuffers++;
+    }
+
+    // A new DMA buffer has started.
+    // Prepare the buffer after the active one.
+    if (NRF_SAADC->EVENTS_STARTED) {
+        NRF_SAADC->EVENTS_STARTED = 0;
+
+        uint32_t nextIndex =
+            (completedBuffers + 1) % BUFFER_COUNT;
+
+        NRF_SAADC->RESULT.PTR =
+            (uint32_t)adcBuffers[nextIndex];
+
+        NRF_SAADC->RESULT.MAXCNT = BUFFER_SIZE;
+    }
 }
 
 // ----------------------------
-// Serial output
+// Configure SAADC hardware
 // ----------------------------
 
-void printMeasurement() {
-    if (!Serial.isConnected()) {
-        return;
+bool startADC() {
+    // Do not use analogRead() after this point.
+
+    NRF_SAADC->ENABLE = 0;
+
+    // Disable all channels
+    for (int i = 0; i < 8; i++) {
+        NRF_SAADC->CH[i].PSELP = 0;
+        NRF_SAADC->CH[i].PSELN = 0;
     }
 
-    Measurement &m = latestMeasurement;
+    // A1 on Argon = nRF52840 AIN2
+    NRF_SAADC->CH[0].PSELP =
+        SAADC_CH_PSELP_PSELP_AnalogInput2;
 
-    Serial.print(m.dc, 6);
+    NRF_SAADC->CH[0].PSELN = 0;
 
-    for (int i = 0; i < 3; i++) {
-        Serial.print(",");
-        Serial.print(m.amplitude[i], 6);
+    // Match Particle's nominal 0-3.3V
+    // single-ended ADC configuration.
+    NRF_SAADC->CH[0].CONFIG =
+        (SAADC_CH_CONFIG_GAIN_Gain1_4
+            << SAADC_CH_CONFIG_GAIN_Pos) |
+        (SAADC_CH_CONFIG_REFSEL_VDD1_4
+            << SAADC_CH_CONFIG_REFSEL_Pos) |
+        (SAADC_CH_CONFIG_TACQ_10us
+            << SAADC_CH_CONFIG_TACQ_Pos) |
+        (SAADC_CH_CONFIG_MODE_SE
+            << SAADC_CH_CONFIG_MODE_Pos);
+
+    // 12-bit resolution, no oversampling
+    NRF_SAADC->RESOLUTION =
+        SAADC_RESOLUTION_VAL_12bit;
+
+    NRF_SAADC->OVERSAMPLE = 0;
+
+    // Internal timer:
+    // 16 MHz / 800 = 20,000 Hz
+    const uint32_t cc = 16000000UL / SAMPLE_RATE;
+
+    NRF_SAADC->SAMPLERATE =
+        (SAADC_SAMPLERATE_MODE_Timers
+            << SAADC_SAMPLERATE_MODE_Pos) |
+        (cc << SAADC_SAMPLERATE_CC_Pos);
+
+    // Initial DMA buffer
+    NRF_SAADC->RESULT.PTR =
+        (uint32_t)adcBuffers[0];
+
+    NRF_SAADC->RESULT.MAXCNT = BUFFER_SIZE;
+
+    // Clear existing interrupts/events
+    NRF_SAADC->INTENCLR = 0xFFFFFFFFUL;
+
+    NRF_SAADC->EVENTS_END = 0;
+    NRF_SAADC->EVENTS_STARTED = 0;
+
+    // Attach direct interrupt handler
+    if (!attachInterruptDirect(
+            SAADC_IRQn, saadcInterrupt, false)) {
+        return false;
     }
 
-    Serial.print(",");
-    Serial.print(m.droppedBuffers);
+    // Allocate a PPI channel managed by
+    // the existing Nordic SDK.
+    ret_code_t err =
+        nrfx_ppi_channel_alloc(&ppiChannel);
 
-    Serial.print(",");
-    Serial.println(m.invalidWindows);
+    if (err != 0) {
+        return false;
+    }
+
+    // Automatically restart the SAADC
+    // when a DMA buffer is full.
+    err = nrfx_ppi_channel_assign(
+        ppiChannel,
+        (uint32_t)&NRF_SAADC->EVENTS_END,
+        (uint32_t)&NRF_SAADC->TASKS_START
+    );
+
+    if (err != 0) {
+        return false;
+    }
+
+    err = nrfx_ppi_channel_enable(ppiChannel);
+
+    if (err != 0) {
+        return false;
+    }
+
+    // Enable END and STARTED interrupts
+    NRF_SAADC->INTENSET =
+        SAADC_INTENSET_END_Msk |
+        SAADC_INTENSET_STARTED_Msk;
+
+    // Low interrupt priority compatible
+    // with the Nordic SoftDevice.
+    NVIC_SetPriority(SAADC_IRQn, 6);
+    NVIC_ClearPendingIRQ(SAADC_IRQn);
+    NVIC_EnableIRQ(SAADC_IRQn);
+
+    // Enable ADC
+    NRF_SAADC->ENABLE =
+        SAADC_ENABLE_ENABLE_Enabled;
+
+    // Begin acquisition
+    NRF_SAADC->TASKS_START = 1;
+
+    return true;
 }
 
 // ----------------------------
@@ -273,19 +334,18 @@ void printMeasurement() {
 void setup() {
     Serial.begin(115200);
 
-    // Configure hardware PWM
+    // Configure LEDs
     for (int i = 0; i < 3; i++) {
         pinMode(LED_PINS[i], OUTPUT);
 
         analogWrite(
             LED_PINS[i],
-            DUTY_CYCLE,
+            128,
             LED_FREQS[i]
         );
 
-        // Reference oscillator increments
         float angle =
-            TWO_PI * LED_FREQS[i] / SAMPLE_RATE;
+            TWO_PI_F * LED_FREQS[i] / SAMPLE_RATE;
 
         channels[i].cosStep = cosf(angle);
         channels[i].sinStep = sinf(angle);
@@ -293,27 +353,7 @@ void setup() {
 
     resetWindow();
 
-    // Configure continuous ADC DMA
-    adcError = adc
-        .withSampleFreqHz(SAMPLE_RATE)
-        .withDoubleBuffer(
-            BUFFER_SIZE,
-            buffer0,
-            buffer1
-        )
-        .withSamplePin(SENSOR_PIN)
-        .withResolution(NRF_SAADC_RESOLUTION_12BIT)
-        .withAcqTime(NRF_SAADC_ACQTIME_10US)
-        .withBufferCallback(onBufferReady)
-        .init();
-
-    if (adcError != 0) {
-        return;
-    }
-
-    // Start hardware-timed acquisition
-    adc.start();
-    adcStarted = true;
+    adcRunning = startADC();
 }
 
 // ----------------------------
@@ -321,17 +361,15 @@ void setup() {
 // ----------------------------
 
 void loop() {
-    // Handle serial connection
     if (Serial.isConnected()) {
         if (!headerPrinted) {
-            if (!adcStarted) {
-                Serial.print("ADC initialization failed: ");
-                Serial.println((unsigned long)adcError);
-            } else {
+            if (adcRunning) {
                 Serial.println(
                     "dc_v,red_v,ir805_v,ir940_v,"
                     "dropped_buffers,invalid_windows"
                 );
+            } else {
+                Serial.println("ERROR: ADC initialization failed");
             }
 
             headerPrinted = true;
@@ -340,52 +378,35 @@ void loop() {
         headerPrinted = false;
     }
 
-    if (!adcStarted) {
+    if (!adcRunning) {
         return;
     }
 
-    // Retrieve completed DMA buffer.
-    // Keep interrupt masking very short.
-    nrf_saadc_value_t *buffer;
-    uint32_t sequence;
+    uint32_t available = completedBuffers;
 
-    noInterrupts();
-
-    buffer = readyBuffer;
-    sequence = readySequence;
-    readyBuffer = nullptr;
-
-    interrupts();
-
-    if (buffer != nullptr) {
-
-        // Detect skipped buffers
-        uint32_t expected = lastSequence + 1;
-
-        if (sequence != expected) {
-            droppedBuffers +=
-                sequence - expected;
-
-            // Discard incomplete measurement.
-            // A gap makes the correlation invalid.
-            if (sampleCount != 0) {
-                invalidWindows++;
-            }
-
-            resetWindow();
-        }
-
-        lastSequence = sequence;
-
-        // Process samples while DMA fills
-        // the other buffer.
-        processBuffer(buffer, BUFFER_SIZE);
+    if (available == processedBuffers) {
+        return;
     }
 
-    // Serial output is outside both the
-    // DMA callback and the sample loop.
-    if (measurementReady && Serial.isConnected()) {
-        printMeasurement();
-        measurementReady = false;
+    // Avoid reading buffers that DMA is
+    // about to reuse.
+    uint32_t backlog = available - processedBuffers;
+
+    if (backlog > BUFFER_COUNT - 2) {
+        uint32_t skipped = backlog - 1;
+
+        droppedBuffers += skipped;
+        invalidWindows++;
+
+        processedBuffers = available - 1;
+
+        resetWindow();
     }
+
+    uint32_t index =
+        processedBuffers % BUFFER_COUNT;
+
+    processBuffer(index);
+
+    processedBuffers++;
 }
